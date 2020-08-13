@@ -1168,6 +1168,10 @@ class XBRL {
 
 		$taxonomy->setBaseTaxonomy( $baseTaxonomy );
 
+		// BMS 2020-05-20 The previously imported namespaces are captured so actions
+		//                that should affect extension schemas, such as getting all
+		//                all elements, can skip skip operating on base taxonomy schemas
+		$context->previouslyImportedSchemaNamespaces = array_keys( $context->importedSchemas );
 		$context->importedSchemas[ $namespace ] =& $taxonomy;
 		$context->schemaFileToNamespace[ $taxonomy->getSchemaLocation() ] = $namespace;
 		$context->schemaFileToNamespace[ $taxonomy->getTaxonomyXSD() ] = $namespace;
@@ -1235,8 +1239,13 @@ class XBRL {
 		// Get the basename from the taxonomy if one is not supplied but if one is, make sure only the basename is used even if a full path has been specified.
 		$output_basename = $output_basename === null ? $pathinfo['filename'] : basename( $output_basename );
 
+		$labelTaxonomies = array_filter( $taxonomy->context->importedSchemas, function( $tax )
+		{
+			return isset( $tax->labels[ XBRL_Constants::$defaultLinkRole ] );
+		} );
+
 		// Now remove the existng labels, arcs and locators so the saved file only contains the extension components
-		if ( ! isset( $taxonomy->labels[ XBRL_Constants::$defaultLinkRole ] ) )
+		if ( count( $labelTaxonomies ) == 0 )
 		{
 			XBRL_Log::getInstance()->err( "There are no labels in the extension taxonomy" );
 			return false;
@@ -1246,15 +1255,43 @@ class XBRL {
 		// Normally the labels are held within the context but when an extension
 		// taxonomy is being processed, a copy of the extension taxonomy labels
 		// is held in the XBRL instance prepresenting the extension taxonomy.
-		// See the end of the processLabelLinkbase() function in class XBRL.
-		$labels =& $taxonomy->labels[ XBRL_Constants::$defaultLinkRole ];
+		// See the end of the processLabelLinkbaseXml() function in class XBRL.
+		$taxonomy->context->labels = array();
 
-		// Put them into the context
-		$taxonomy->context->labels[ XBRL_Constants::$defaultLinkRole ] = $labels;
+		// Put them into the context.  This is so just the labels unique to the extension
+		// taxonomy will be saved.  The full set of labels will be reconstructed when the
+		// the extension taxonomy is load *on top of* the relevant base taxonomy
+		foreach ( $labelTaxonomies as $namespace => $tax )
+		{
+			foreach ( $tax->labels as $roleRefsKey => $labelDetail )
+			{
+				if ( count( $taxonomy->context->labels ) )
+				{
+					// Now there is a set of locators, arcs, labels and $labelsByHref to store in the context
+					$this->context->addLabels( $labelDetail['locators'], $labelDetail['arcs'], $labelDetail['labels'], $labelDetail['labelsByHref'], $roleRefsKey );
+
+				}
+				else
+				{
+					$taxonomy->context->labels[ $roleRefsKey ] =& $labelDetail;
+				}
+			}
+		}
+
+		unset( $tax );
 
 		// Delete the other schemas
 		// $taxonomy->context->importedSchemas = array( $namespace => $taxonomy );
 		$taxonomy->context->importedSchemas = array_diff_key( $taxonomy->context->importedSchemas, $taxonomy->previouslyImportedSchemas );
+
+		// Remove types belonging to previouslyImportedSchemas
+		$types = $taxonomy->context->types;
+
+		foreach( $taxonomy->previouslyImportedSchemas as $namespace => $tax )
+		{
+			$count = $types->removeElementsTaxonomy( $tax );
+			// echo "$count elements removed for {$tax->getPrefix()}\n";
+		}
 
 		// Create and save the JSON
 		$json = $taxonomy->toJSON( $taxonomy->baseTaxonomy );
@@ -1292,25 +1329,35 @@ class XBRL {
 
 		// Check the taxonomy location
 		$context = XBRL_Global::getInstance();
-		if ( $context->useCache )
+		// BMS 2020-05-22 Don't remember why this section of code did not use XBRL::getXml()
+		//                Changing the $taxonomy_file to point to a cached file causes other
+		//                that do not occur when using getXml.  Anyway, it uses getXml now.
+		// if ( $context->useCache )
+		// {
+		// 	if ( ( $path = $context->findCachedFile( $taxonomy_file ) ) !== false )
+		// 	{
+		// 		$taxonomy_file = $path;
+		// 	}
+		// }
+        //
+		// if ( filter_var( $taxonomy_file, FILTER_VALIDATE_URL ) === false )
+		// {
+		// 	// If the taxonomy file is not a url make sure the file exists
+		// 	if ( ! file_exists( $taxonomy_file ) )
+		// 	{
+		// 		XBRL_Log::getInstance()->err( "The supplied extension taxonomy file does not exist." );
+		// 		return false;
+		// 	}
+		// }
+        //
+		// $xbrlDocument = simplexml_load_file( $taxonomy_file );
+		$xbrlDocument = XBRL::getXml( $taxonomy_file, $context );
+		if ( ! $xbrlDocument )
 		{
-			if ( ( $path = $context->findCachedFile( $taxonomy_file ) ) !== false )
-			{
-				$taxonomy_file = $path;
-			}
+			XBRL_Log::getInstance()->err( "The supplied extension taxonomy file does not exist." );
+			return false;
 		}
 
-		if ( filter_var( $taxonomy_file, FILTER_VALIDATE_URL ) === false )
-		{
-			// If the taxonomy file is not a url make sure the file exists
-			if ( ! file_exists( $taxonomy_file ) )
-			{
-				XBRL_Log::getInstance()->err( "The supplied extension taxonomy file does not exist." );
-				return false;
-			}
-		}
-
-		$xbrlDocument = simplexml_load_file( $taxonomy_file );
 		if ( $namespace === null )
 		{
 			if ( ! isset( $xbrlDocument['targetNamespace'] ) )
@@ -2072,7 +2119,7 @@ class XBRL {
 	}
 
 	/**
-	 * Return the details of a namespace if it exists or null
+	 * Return the details of a linkbase if it exists or null
 	 * @param string $linkbaseName
 	 * @return NULL|array
 	 */
@@ -2344,9 +2391,84 @@ class XBRL {
 		return $languages;
 	}
 
+	/**
+	 * Return an array of the preferred labels used.
+	 * @param string $extendedLinkRole
+	 * @return string[]
+	 */
+	public function getPreferredLabelRoles( $extendedLinkRole = null )
+	{
+		if ( $extendedLinkRole )
+		{
+			if ( ! isset( $this->context->labels[ $extendedLinkRole ] ) ) return array();
+			return array_keys( $this->context->labels[ $extendedLinkRole ]['labels'] );
+		}
+
+		$roles = array();
+
+		foreach ( $this->context->labels as $linkRole => $linkLabels )
+		{
+			$roles = array_merge( $roles, array_keys( $linkLabels['labels'] ) );
+		}
+
+		return array_unique( $roles );
+	}
+
 	public function hasLanguage( $lang )
 	{
 		return in_array( $lang, $this->getLabelLanguages() );
+	}
+
+	public function array_any( &$array, $callback )
+	{
+		foreach ( $array as $key => $item )
+		{
+			if ( $callback( $key, $item ) ) return true;
+		}
+
+		return false;
+	}
+
+	/**
+	 * Return true if there exists a label for the language, preferred role and extended link role.
+	 * @param string $href
+	 * @param string $lang
+	 * @param string $role (optional) Defaults to XBRL_Constants::$labelRoleLabel
+	 * @param string $extendedLinkRole (optional) Defaults to XBRL_Constants::$defaultLinkRole
+	 * @return bool
+	 */
+	public function conceptHasLanguageRole( $href, $lang, $role, $extendedLinkRole = null )
+	{
+		if ( is_null( $extendedLinkRole ) ) $extendedLinkRole = XBRL_Constants::$defaultLinkRole;
+		if ( is_null( $role ) ) $role = XBRL_Constants::$labelRoleLabel;
+
+		if ( ! isset( $this->context->labels[ $extendedLinkRole ]['arcs'][ $href ] ) ) return false;
+		return $this->array_any( $this->context->labels[ $extendedLinkRole ]['arcs'][ $href ], function( $label, $labels ) use ( $role )
+		{
+			return $this->array_any( $labels, function( $key, $details ) use( $role ) { return $details['role'] == $role; } );
+		} );
+	}
+
+	/**
+	 *
+	 * @param string $href
+	 * @param string $extendedLinkRole (optional) Defaults to XBRL_Constants::$defaultLinkRole
+	 * @return string[]
+	 */
+	public function getConceptLabelRoles( $href, $extendedLinkRole = null )
+	{
+		if ( is_null( $extendedLinkRole ) ) $extendedLinkRole = XBRL_Constants::$defaultLinkRole;
+		if ( ! isset( $this->context->labels[ $extendedLinkRole ]['arcs'][ $href ] ) ) return false;
+
+		return array_reduce( $this->context->labels[ $extendedLinkRole ]['arcs'][ $href ], function( $carry, $labels )
+		{
+			$roles = array_merge( $carry, array_reduce( $labels, function( $carry, $details )
+			{
+				$carry[] = $details['role'];
+				return $carry;
+			}, array() ) );
+			return $roles;
+		}, array() );
 	}
 
 	/**
@@ -2422,9 +2544,10 @@ class XBRL {
 	 * Provide access to the private presentationRoleRefs array
 	 * @param array[string]|null $filter
 	 * @param boolean $sort
+	 * @param string $lang a locale to use when returning the text. Defaults to null to use the default.
 	 * @return void
 	 */
-	public function &getPresentationRoleRefs( $filter = array(), $sort = true )
+	public function &getPresentationRoleRefs( $filter = array(), $sort = true, $lang = null )
 	{
 		// Make sure the filter is initialized and contains lowercase values
 		if ( ! is_array( $filter ) ) $filter = array();
@@ -2454,7 +2577,7 @@ class XBRL {
 				$result[ $refKey ] = $this->context->presentationRoleRefs[ $refKey ];
 			}
 
-			$result[ $refKey ]['text'] = $this->getPresentationLinkRoleDescription( $ref );
+			$result[ $refKey ]['text'] = $this->getPresentationLinkRoleDescription( $ref, $lang );
 		}
 
 		if ( $sort )
@@ -2788,40 +2911,6 @@ class XBRL {
 
 		return $result;
 
-		/*
-		if ( ! isset( $this->definitionRoleRefs[ $roleRefsKey ] ) ) return array();
-		$role = $this->definitionRoleRefs[ $roleRefsKey ];
-
-		// If there are no dimensions in this role, maybe the role exists in another taxonomy
-		if ( ! isset( $role['dimensions'] ) )
-		{
-			if ( strpos( $role['href'], $this->getTaxonomyXSD() ) === false )
-			{
-				return $this->getTaxonomyForXSD( $role['href'] )->getDefinitionRoleDimensions( $roleRefsKey );
-			}
-		}
-		else
-		{
-			$result = array();
-
-			foreach ( $role['dimensions'] as $dimensionKey => $href )
-			{
-				if ( ! isset( $result[ $dimensionKey ] ) )
-				{
-					$result[ $dimensionKey ] = array( 'href' => $href, 'roles' => array( $roleRefsKey ) );
-					continue;
-				}
-
-				// Add unique roleRefsKey
-				if ( in_array( $roleRefsKey, $result[ $dimensionKey ]['roles'] ) ) continue;
-				$result[ $dimensionKey ]['roles'][] = $roleRefsKey;
-			}
-
-			return $result;
-		}
-
-		return array();
-		*/
 	}
 
 	/**
@@ -3972,22 +4061,43 @@ class XBRL {
 	}
 
 	/**
-	 * Returns an array of elements across all taxonomies
+	 * Returns an array of elements across all base taxonomy taxonomies
 	 * @return array
 	 */
-	public function getAllElements()
+	public function getAllBaseTaxonomyElements()
 	{
-		if ( $this->context->isExtensionTaxonomy() )
-		{
-			$prefix = $this->getPrefix();
-			return array_map( function( $item ) use ( $prefix ) { $item['prefix'] = $prefix; return $item; }, $this->elementIndex );
-		}
+		return $this->getAllElements( true, false );
+	}
+
+	/**
+	 * Returns an array of elements across all taxonomies.  The arguments are only relevant
+	 * when the main taxonomy is an extension taxonomy.
+	 * @param boolean $includeBaseTaxonomyElements (default: false)
+	 * @param boolean $includeExtensionTaxonomyElements (default: true)
+	 * @return array
+	 */
+	public function getAllElements( $includeBaseTaxonomyElements = false, $includeExtensionTaxonomyElements = true )
+	{
+		$filterUsingArgs =	$this->context->isExtensionTaxonomy() &&
+							property_exists( $this->context, 'previouslyImportedSchemaNamespaces' ) &&
+							is_array( $this->context->previouslyImportedSchemaNamespaces );
 
 		$result = array();
+		if ( $filterUsingArgs && ! $includeBaseTaxonomyElements && ! $includeExtensionTaxonomyElements ) return $result;
+
 		foreach ( $this->context->importedSchemas as $namespace => $taxonomy )
 		{
+			if ( $filterUsingArgs )
+			{
+				// If excluding base taxonomy elements and the previouslyImportedSchemaNamespaces array contains the namespace then ignore
+				if ( ! $includeBaseTaxonomyElements && array_search( $namespace, $this->context->previouslyImportedSchemaNamespaces ) !== false ) continue;
+				// If excluding extension taxonomy elements and the previouslyImportedSchemaNamespaces array does not contain the namespace then ignore
+				if ( ! $includeExtensionTaxonomyElements && array_search( $namespace, $this->context->previouslyImportedSchemaNamespaces ) === false ) continue;
+			}
+
 			$elements = $taxonomy->getElements();
-			if ( ! $elements ) continue; // Don't attempt to merge if there are no element and it take time
+			if ( ! $elements ) continue; // Don't attempt to merge if there are no element as it take time
+			// Add the taxonomy prefix to each element
 			$prefix = $taxonomy->getPrefix();
 			$elements = array_map( function( $item ) use ( $prefix ) { $item['prefix'] = $prefix; return $item; }, $elements );
 			$result = array_merge( $result, $elements );
@@ -4032,7 +4142,7 @@ class XBRL {
 
 	/**
 	 * Returns the flag indicating whether or not the taxonomy includes formulas
-	 * @param bool $checkAllSchemas (optional) Forces the test to look at all taxonomies and return true if any one taxonomy has formulas
+	 * @param bool $checkAllSchemas (optional: default = false) Forces the test to look at all taxonomies and return true if any one taxonomy has formulas
 	 * @return boolean
 	 */
 	public function getHasFormulas( $checkAllSchemas = false )
@@ -4261,7 +4371,7 @@ class XBRL {
 
 	/**
 	 * Get a list of imported schemas
-	 * @return an array of all loaded schemas
+	 * @return XBRL[] an array of all loaded schemas
 	 */
 	public function getImportedSchemas()
 	{
@@ -4688,11 +4798,12 @@ class XBRL {
 	 * Return the description or title for a specific role
 	 *
 	 * @param array $role The role for which the description should be returned
+	 * @param string $lang a locale to use when returning the text. Defaults to null to use the default.
 	 * @return string
 	 */
-	public function getPresentationLinkRoleDescription( $role )
+	public function getPresentationLinkRoleDescription( $role, $lang = null )
 	{
-		return $this->getLinkRoleDescription( $role, 'link:presentationLink', 'presentation link' );
+		return $this->getLinkRoleDescription( $role, 'link:presentationLink', 'presentation link', $lang );
 	}
 
 	/**
@@ -4701,9 +4812,10 @@ class XBRL {
 	 * @param string $role
 	 * @param string $roleType
 	 * @param string $roleTitle
+	 * @param string $lang a locale to use when returning the text. Defaults to null to use the default.
 	 * @return boolean|string
 	 */
-	private function getLinkRoleDescription( $role, $roleType, $roleTitle )
+	public function getLinkRoleDescription( $role, $roleType, $roleTitle, $lang = null )
 	{
 		$href = parse_url( $role['href'] );
 		$basename = basename( $href['path'] );
@@ -4735,7 +4847,7 @@ class XBRL {
 		{
 			foreach ( $arcs as $arc )
 			{
-				if ( ! ( $label = $roleTaxonomy->getGenericLabel( XBRL_Constants::$genericRoleLabel, $arc['to'], 'da' ) ) ) continue;
+				if ( ! ( $label = $roleTaxonomy->getGenericLabel( XBRL_Constants::$genericRoleLabel, $arc['to'], $lang ? $lang : $this->getDefaultLanguage() ) ) ) continue;
 				return $label[ $arc['to'] ]['text'];
 			}
 		}
@@ -11342,7 +11454,7 @@ class XBRL {
 						case XBRL_Constants::$arcRoleAll:
 						case XBRL_Constants::$arcRoleNotAll:
 
-							if ( ! isset( $hypercubes[ $nodeKey ] ) ) continue;
+							if ( ! isset( $hypercubes[ $nodeKey ] ) ) break;
 							$hypercubes[ $nodeKey ]['parents'][ $parentKey ] = $parent;
 
 							foreach ( $primaryItems as $primaryItemId => $primaryItem )
@@ -11422,7 +11534,7 @@ class XBRL {
 							{
 								if ( ! isset( $nodes[ $parentKey ]['parents'] ) )
 								{
-									continue;
+									break;
 								}
 
 								// Look up the hierarhcy to see if a parent is a primary item
@@ -11458,7 +11570,7 @@ class XBRL {
 									return false;
 								};
 
-								if ( ( $parentNodeKey = $parentsArePrimary( $nodes[$parentKey]['parents'] ) ) === false ) continue;
+								if ( ( $parentNodeKey = $parentsArePrimary( $nodes[$parentKey]['parents'] ) ) === false ) continue 2;
 
 								$updateReferences( $parentKey, $parentNodeKey, $nodes[ $parentNodeKey ] );
 							}
@@ -11473,10 +11585,10 @@ class XBRL {
 
 						case XBRL_Constants::$arcRoleHypercubeDimension:
 
-							if ( $parent['arcrole'] !== XBRL_Constants::$arcRoleHypercubeDimension ) continue;
+							if ( $parent['arcrole'] !== XBRL_Constants::$arcRoleHypercubeDimension ) break;
 							// if ( $parent['arcrole_old'] !== 'hypercube-dimension' ) continue;
 
-							if ( ! isset( $hypercubes[ $parentKey ] ) ) continue;
+							if ( ! isset( $hypercubes[ $parentKey ] ) ) break;
 
 							if ( ! isset( $hypercubes[ $parentKey ]['dimensions'] ) )
 								$hypercubes[ $parentKey ]['dimensions'] = array();
@@ -17041,7 +17153,7 @@ class XBRL {
 										case 'role':
 										case 'href':
 										case 'nodeclass':
-											continue;
+											break;
 
 										default:
 											if ( ! isset( $newRole['hypercubes'][ $hypercubeKey ][ $key ] ) )
@@ -17398,7 +17510,7 @@ class XBRL {
 									$this->log()->taxonomy_validation( "Role Type", "id attribute is not a valid NCName", array( 'id' => $id ) );
 								}
 							}
-							if ( ! $roleUri )
+							if ( ! $roleUri && ! isset( \XBRL_Global::$taxonomiesToIgnore[ $this->getSchemaLocation() ] ) )
 							{
 								$this->log()->taxonomy_validation( "Role Type", "roleURI attribute does not exist or is empty", array() );
 							}
@@ -18560,7 +18672,19 @@ class XBRL {
 
 		$patterns = array('~/{2,}~', '~/(\./)+~', '~([^/\.]+/(?R)*\.{2,}/)~', '~\.\./~');
 	    $replacements = array('/', '/', '', '');
-	    return preg_replace($patterns, $replacements, $path);
+	    $prefix = '';
+		if ( strpos( $path, 'http://' ) === 0 )
+		{
+			$prefix = 'http:/';
+			$path = substr( $path, 6 );
+		}
+		if ( strpos( $path, 'https://' ) === 0 )
+		{
+			$prefix = 'https:/';
+			$path = substr( $path, 7 );
+		}
+
+	    return $prefix . preg_replace($patterns, $replacements, $path);
 	}
 
 	/**
@@ -18585,6 +18709,126 @@ class XBRL {
 			$carry[ $key ] = $value;
 			return $carry;
 		}, array() );
+	}
+
+	public static function preferredLabelToDescription( $preferredLabelBasename )
+	{
+		$text = preg_match("/^([a-z]+)/", $preferredLabelBasename, $matches ) ? ucfirst( $matches[1] ) : '';
+		if( preg_match_all("/([0-9]+|[A-Z][a-z]*)/", $preferredLabelBasename, $matches ) )
+		{
+			if ( $text ) $text .= ' ';
+			$text .= implode( ' ', array_filter( array_map( function( $item ) { return lcfirst( $item ); }, $matches[1] ), function( $preferredLabelBasename ) { return $preferredLabelBasename != 'label'; } ) );
+		}
+
+		if ( $text == 'Label' ) $text = 'Standard';
+
+		return $text;
+	}
+
+	/**
+	 * Get the link role registry information.
+	 * Create the file lrr.json if it does not exist
+	 */
+	public static function getLRR()
+	{
+		$filename =  __DIR__ . '/lrr.json';
+
+		if ( ! file_exists( $filename ) )
+		{
+			$lrr = array();
+
+			$linkTypes = [];
+			$linkTypes = array(
+				\XBRL_Constants::$linkFootnote,
+				\XBRL_Constants::$linkLabel,
+				\XBRL_Constants::$linkReference
+			);
+
+			$builtInRoles = array(
+				\XBRL_Constants::$labelRoleLabel => "Standard label for a concept.",
+				\XBRL_Constants::$labelRoleTerseLabel => "Short label for a concept, often omitting text that should be inferable when the concept is reported in the context of other related concepts.",
+				\XBRL_Constants::$labelRoleVerboseLabel => "Extended label for a concept, making sure not to omit text that is required to enable the label to be understood on a stand alone basis.",
+				\XBRL_Constants::$labelRolePositiveLabel => "Standard label for a concept when the value of the concept is positive.",
+				\XBRL_Constants::$labelRolePositiveTerseLabel => "Terse label for a concept when the value of the concept is positive.",
+				\XBRL_Constants::$labelRolePositiveVerboseLabel => "Verbose label for a concept when the value of the concept is positive.",
+				\XBRL_Constants::$labelRoleZeroLabel => "Standard label of a concept when the value of the concept is negative.",
+				\XBRL_Constants::$labelRoleZeroTerseLabel => "Terse label of a concept when the value of the concept is negative.",
+				\XBRL_Constants::$labelRoleZeroVerboseLabel => "Verbose label of a concept when the value of the concept is negative.",
+				\XBRL_Constants::$labelRoleNegativeLabel => "Standard label of a concept when the value of the concept is negative.",
+				\XBRL_Constants::$labelRoleNegativeTerseLabel => "Terse label of a concept when the value of the concept is negative.",
+				\XBRL_Constants::$labelRoleNegativeVerboseLabel => "Verbose label of a concept when the value of the concept is negative.",
+				\XBRL_Constants::$labelRoleTotalLabel => "The label for a concept for use in presenting values associated with the concept when it is being reported as the total of a set of other values.",
+				\XBRL_Constants::$labelRolePeriodStartLabel => "The label for a concept with instantaneous=\"true\" for use in presenting values associated with the concept when it is being report as a beginning of period value.",
+				\XBRL_Constants::$labelRolePeriodEndLabel => "The label for a concept with instantaneous=\"true\" for use in presenting values associated with the concept when it is being reported as an end of period value.",
+				\XBRL_Constants::$labelRoleDocumentation => "Documentation of a concept, providing an explanation of its meaning and its appropriate usage and any other documentation deemed necessary.",
+				\XBRL_Constants::$labelRoleDefinitionGuidance => "A precise definition of a concept, providing an explanation of its meaning and its appropriate usage.",
+				\XBRL_Constants::$labelRoleDisclosureGuidance => "An explanation of the disclosure requirements relating to the concept. Indicates whether the disclosure is mandatory (i.e. prescribed by authoritative literature), recommended (i.e. encouraged by authoritative literature), common practice (i.e. not prescribed by authoritative literature, but disclosure is common place), or structural completeness (i.e. merely included to complete the structure of the taxonomy).",
+				\XBRL_Constants::$labelRolePresentationGuidance => "An explanation of the rules guiding presentation (placement and/or labeling) of this concept in the context of other concepts in one or more specific types of business reports. For example, \"Net Surplus should be disclosed on the face of the Profit and Loss statement\".",
+				\XBRL_Constants::$labelRolePlacementGuidance => "An explanation of the rules guiding placement of this concept in the context of other concepts in one or more specific types of business reporting.",
+				\XBRL_Constants::$labelRoleMeasurementGuidance => "An explanation of the method(s) required to be used when measuring values associated with this concept in business reports.",
+				\XBRL_Constants::$labelRoleCommentaryGuidance => "Any other general commentary on the concept that assists in determining definition, disclosure, measurement, presentation or usage.",
+				\XBRL_Constants::$labelRoleExampleGuidance => "An example of the type of information intended to be captured by the concept.",
+				\XBRL_DFR::$originallyStatedLabel => "Label indicating a concept representing the value that was originally stated."
+			);
+
+			foreach ( $builtInRoles as $roleURI => $definition )
+			{
+				$label = basename( $roleURI );
+				$lrr[ $roleURI ] = array(
+					'text' => self::preferredLabelToDescription( $label ),
+					'definition' => $definition,
+					'href' => "http://www.xbrl.org/2003/xbrl-role-2003-07-31.xsd#$label",
+					'label' => $label,
+					'namespace' => 'http://www.xbrl.org/2003/role'
+				);
+			}
+
+			$doc = simplexml_load_file("http://www.xbrl.org/lrr/lrr.xml");
+			foreach( $doc->children('lrr', true)->roles as $lrrRoles )
+			{
+				foreach ( $lrrRoles as $lrrRole )
+				{
+					$href = trim( $lrrRole->authoritativeHref );
+					$uri = strstr( $href, '#', true );
+					$namespace = '';
+					if ( ! isset( $linkTypes[ $uri ] ) )
+					{
+						$taxonomy = \XBRL::load_taxonomy( $uri );
+						$namespace = $taxonomy->getNamespace();
+						$roleTypes[ $uri ] = $taxonomy->getRoleTypes( $taxonomy->getTaxonomyXSD() );
+					}
+
+					$roleURI = trim( $lrrRole->roleURI->__toString() );
+
+					$role = null;
+					foreach ( $linkTypes as $linkType )
+					{
+						if ( ! isset( $roleTypes[ $uri ][ $linkType ][ $roleURI ] ) ) continue;
+						$role = $roleTypes[ $uri ][ $linkType ][ $roleURI ];
+						break;
+					}
+					if ( ! $role ) continue;
+
+					$label = basename($roleURI);
+
+					$lrr[ $roleURI ] = array(
+						'text' => self::preferredLabelToDescription( $label ),
+						'definition' => $role['definition'],
+						'href' => $href,
+						'label' => $label,
+						'namespace' => $namespace
+					);
+				}
+			}
+
+			file_put_contents( $filename, json_encode( $lrr ) );
+		}
+		else
+		{
+			$lrr = json_decode( file_get_contents( $filename ), true );
+		}
+
+		return $lrr;
 	}
 
 	/**
@@ -18616,6 +18860,43 @@ class XBRL {
 		if ( ! is_numeric( $weight ) ) $weight = null;
 
 		return hash( "sha256", "$elementName-$linkName-$linkRole-$fromHref-$toHref-$order-$weight-$preferredLabel" );
+	}
+
+	/**
+	 * Process a schema recursively so the xml and xsds referenced are added to the cache implied by $context
+	 * @param string $xml
+	 * @param SimpleXMLElement $schema
+	 * @param XBRL_Global $context
+	 * @param XBRL_Log $log
+	 */
+	public static function processSchema( $xsd, $schema, $context, $log, &$loaded )
+	{
+		if ( ! $schema ) return;
+
+		// Process the linkbases
+		foreach( $schema->annotation->appinfo->children('link', true)->linkbaseRef as $x => /** @var SimpleXMLElement $element */ $element )
+		{
+			$location = (string)$element->attributes('xlink', true)->href;
+			$href = XBRL::resolve_path( $xsd, $location );
+			if ( array_search( $href, $loaded ) !== false ) continue;
+			$loaded[] = $href;
+			$mapping = \XBRL::getXml( $href, $context );
+		}
+
+		// Process the imports
+		foreach( $schema->import as $x => /** @var SimpleXMLElement $element */ $element )
+		{
+			$location = (string)$element->attributes()->schemaLocation;
+			$href = XBRL::resolve_path( $xsd, $location );
+			if ( array_search( $href, $loaded ) !== false ) continue;
+			if ( XBRL::startsWith( $href, 'http://www.xbrl.org' ) ) continue;
+			if ( isset( XBRL_Global::$taxonomiesToIgnore[ $href ] ) ) continue;
+
+			$import = \XBRL::getXml( $href, $context );
+			$loaded[] = $href;
+			XBRL::processSchema( $href, $import, $context, $log, $loaded );
+		}
+
 	}
 }
 
